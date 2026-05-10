@@ -5,11 +5,13 @@ import * as Speech from 'expo-speech';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  LayoutChangeEvent,
   PanResponder,
   Pressable,
   StatusBar,
   StyleSheet,
   Text,
+  Vibration,
   View,
 } from 'react-native';
 
@@ -17,9 +19,56 @@ SplashScreen.preventAutoHideAsync();
 
 type Mode = 'rapido' | 'detalhado';
 
+type Detection = {
+  class: string;
+  confidence: number;
+  bbox: [number, number, number, number]; // x,y,w,h normalizados (0..1)
+  distance_m: number;
+  direction: 'esquerda' | 'centro' | 'direita';
+};
+
 const API_URL = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:8000';
 const FLICK_MIN_VELOCITY = 0.4;
 const FLICK_MIN_DISTANCE = 25;
+
+// Loop de detecção contínua
+const DETECT_INTERVAL_MS = 200;             // pausa entre frames
+const PROXIMITY_THRESHOLD_M = 3.0;          // só anuncia objetos < 3m
+const ANNOUNCE_COOLDOWN_MS = 7000;          // mesmo objeto+direção: 7s
+const GLOBAL_ANNOUNCE_COOLDOWN_MS = 2500;   // qualquer anúncio: 2,5s
+
+// Tradução básica COCO → PT-BR para a fala (sincronizada com o backend)
+const PT_LABELS: Record<string, string> = {
+  person: 'pessoa', bicycle: 'bicicleta', car: 'carro', motorcycle: 'motocicleta',
+  airplane: 'avião', bus: 'ônibus', train: 'trem', truck: 'caminhão', boat: 'barco',
+  'traffic light': 'semáforo', 'fire hydrant': 'hidrante', 'stop sign': 'placa de pare',
+  'parking meter': 'parquímetro', bench: 'banco', bird: 'pássaro', cat: 'gato',
+  dog: 'cachorro', horse: 'cavalo', sheep: 'ovelha', cow: 'vaca', elephant: 'elefante',
+  bear: 'urso', zebra: 'zebra', giraffe: 'girafa', backpack: 'mochila',
+  umbrella: 'guarda-chuva', handbag: 'bolsa', tie: 'gravata', suitcase: 'mala',
+  frisbee: 'frisbee', skis: 'esquis', snowboard: 'snowboard', 'sports ball': 'bola',
+  kite: 'pipa', 'baseball bat': 'taco', 'baseball glove': 'luva', skateboard: 'skate',
+  surfboard: 'prancha', 'tennis racket': 'raquete', bottle: 'garrafa',
+  'wine glass': 'taça', cup: 'xícara', fork: 'garfo', knife: 'faca', spoon: 'colher',
+  bowl: 'tigela', banana: 'banana', apple: 'maçã', sandwich: 'sanduíche',
+  orange: 'laranja', broccoli: 'brócolis', carrot: 'cenoura', 'hot dog': 'cachorro-quente',
+  pizza: 'pizza', donut: 'rosquinha', cake: 'bolo', chair: 'cadeira', couch: 'sofá',
+  'potted plant': 'vaso de planta', bed: 'cama', 'dining table': 'mesa',
+  toilet: 'vaso sanitário', tv: 'televisão', laptop: 'notebook', mouse: 'mouse',
+  remote: 'controle', keyboard: 'teclado', 'cell phone': 'celular', microwave: 'micro-ondas',
+  oven: 'forno', toaster: 'torradeira', sink: 'pia', refrigerator: 'geladeira',
+  book: 'livro', clock: 'relógio', vase: 'vaso', scissors: 'tesoura',
+  'teddy bear': 'urso de pelúcia', 'hair drier': 'secador', toothbrush: 'escova',
+};
+
+function ptLabel(name: string) {
+  return PT_LABELS[name] ?? name;
+}
+
+function directionPhrase(d: Detection['direction']) {
+  if (d === 'centro') return 'à frente';
+  return `à ${d}`;
+}
 
 // ── Tela de Início ─────────────────────────────────────────────────────────
 
@@ -53,6 +102,61 @@ function StartScreen({ onStart }: { onStart: () => void }) {
   );
 }
 
+// ── Overlay de Bounding Boxes ──────────────────────────────────────────────
+
+function DetectionsOverlay({
+  detections,
+  imgSize,
+  viewSize,
+}: {
+  detections: Detection[];
+  imgSize: { width: number; height: number } | null;
+  viewSize: { width: number; height: number };
+}) {
+  if (!imgSize || viewSize.width === 0 || viewSize.height === 0) return null;
+
+  // CameraView usa "cover" → escala para preencher e centra cortando o excesso.
+  const scale = Math.max(
+    viewSize.width / imgSize.width,
+    viewSize.height / imgSize.height,
+  );
+  const renderW = imgSize.width * scale;
+  const renderH = imgSize.height * scale;
+  const offsetX = (viewSize.width - renderW) / 2;
+  const offsetY = (viewSize.height - renderH) / 2;
+
+  return (
+    <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+      {detections.map((d, i) => {
+        const [bx, by, bw, bh] = d.bbox;
+        const left = offsetX + bx * renderW;
+        const top = offsetY + by * renderH;
+        const width = bw * renderW;
+        const height = bh * renderH;
+
+        const isClose = d.distance_m < PROXIMITY_THRESHOLD_M;
+        const color = isClose ? '#FF3B30' : '#00E676';
+
+        return (
+          <View
+            key={`${d.class}-${i}`}
+            style={[
+              styles.bbox,
+              { left, top, width, height, borderColor: color },
+            ]}
+          >
+            <View style={[styles.bboxLabel, { backgroundColor: color }]}>
+              <Text style={styles.bboxLabelText} numberOfLines={1}>
+                {ptLabel(d.class)} • {d.distance_m.toFixed(1)} m
+              </Text>
+            </View>
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
 // ── Tela da Câmera ─────────────────────────────────────────────────────────
 
 function CameraContent() {
@@ -60,9 +164,18 @@ function CameraContent() {
   const [mode, setMode] = useState<Mode>('rapido');
   const [statusText, setStatusText] = useState('Toque para descrever');
   const [isProcessing, setIsProcessing] = useState(false);
+  const [detections, setDetections] = useState<Detection[]>([]);
+  const [imgSize, setImgSize] = useState<{ width: number; height: number } | null>(null);
+  const [viewSize, setViewSize] = useState({ width: 0, height: 0 });
+
   const cameraRef = useRef<CameraView>(null);
+  const cameraReadyRef = useRef(false);
   const processingRef = useRef(false);
+  const isMountedRef = useRef(true);
   const modeRef = useRef<Mode>('rapido');
+  const lastAnnouncePerKeyRef = useRef<Record<string, number>>({});
+  const lastGlobalAnnounceRef = useRef(0);
+  const isSpeakingFromAppRef = useRef(false); // controla TTS gerado pelo app
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -72,6 +185,110 @@ function CameraContent() {
       );
     }, 500);
     return () => clearTimeout(t);
+  }, []);
+
+  // ── Loop de detecção contínua ──────────────────────────────────────────
+  useEffect(() => {
+    isMountedRef.current = true;
+
+    const loop = async () => {
+      while (isMountedRef.current) {
+        const ready =
+          cameraReadyRef.current &&
+          cameraRef.current !== null &&
+          !processingRef.current;
+
+        if (!ready) {
+          await wait(DETECT_INTERVAL_MS);
+          continue;
+        }
+
+        try {
+          const photo = await cameraRef.current!.takePictureAsync({
+            base64: true,
+            quality: 0.3,
+            skipProcessing: true,
+            shutterSound: false,
+          });
+
+          if (!photo?.base64) {
+            await wait(DETECT_INTERVAL_MS);
+            continue;
+          }
+
+          const res = await fetch(`${API_URL}/detect`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image: photo.base64 }),
+          });
+
+          if (!res.ok) {
+            await wait(DETECT_INTERVAL_MS * 2);
+            continue;
+          }
+
+          const json = (await res.json()) as { detections: Detection[] };
+          if (!isMountedRef.current) return;
+
+          setDetections(json.detections);
+          if (photo.width && photo.height) {
+            setImgSize({ width: photo.width, height: photo.height });
+          }
+
+          announceProximity(json.detections);
+        } catch {
+          // erros transitórios de rede/captura: ignora e tenta novamente
+        }
+
+        await wait(DETECT_INTERVAL_MS);
+      }
+    };
+
+    loop();
+    return () => {
+      isMountedRef.current = false;
+      Speech.stop();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const announceProximity = useCallback(async (dets: Detection[]) => {
+    if (processingRef.current) return; // descrição completa em andamento
+    const now = Date.now();
+    if (now - lastGlobalAnnounceRef.current < GLOBAL_ANNOUNCE_COOLDOWN_MS) return;
+
+    // Não interrompe falas em andamento (próprias ou da descrição)
+    try {
+      const speaking = await Speech.isSpeakingAsync();
+      if (speaking) return;
+    } catch {
+      // alguns ambientes podem não suportar — segue em frente
+    }
+
+    // Anuncia o objeto mais próximo (< 3m) que esteja fora do cooldown.
+    const close = dets
+      .filter((d) => d.distance_m < PROXIMITY_THRESHOLD_M)
+      .sort((a, b) => a.distance_m - b.distance_m);
+
+    for (const d of close) {
+      const key = `${d.class}|${d.direction}`;
+      const last = lastAnnouncePerKeyRef.current[key] ?? 0;
+      if (now - last < ANNOUNCE_COOLDOWN_MS) continue;
+
+      const text = `${ptLabel(d.class)} próximo ${directionPhrase(d.direction)}`;
+      isSpeakingFromAppRef.current = true;
+      Speech.speak(text, {
+        language: 'pt-BR',
+        rate: 1.05,
+        onDone: () => { isSpeakingFromAppRef.current = false; },
+        onStopped: () => { isSpeakingFromAppRef.current = false; },
+        onError: () => { isSpeakingFromAppRef.current = false; },
+      });
+      lastAnnouncePerKeyRef.current[key] = now;
+      lastGlobalAnnounceRef.current = now;
+      Haptics.selectionAsync();
+      break;
+    }
   }, []);
 
   const toggleMode = useCallback(() => {
@@ -89,8 +306,22 @@ function CameraContent() {
     if (processingRef.current || !cameraRef.current) return;
     processingRef.current = true;
     setIsProcessing(true);
-    setStatusText('Capturando imagem…');
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setStatusText('Descrição de IA em andamento, por favor aguarde…');
+
+    // Padrão tátil distintivo para a IA: 3 pulsos curtos.
+    // Usa `Vibration` em vez de `Haptics` porque o motor háptico
+    // pode falhar silenciosamente em alguns Androids — Vibration sempre
+    // dispara desde que a permissão android.permission.VIBRATE esteja ativa
+    // (já vem por padrão no Expo).
+    // Padrão: [espera, vibra, espera, vibra, espera, vibra]
+    Vibration.vibrate([0, 80, 90, 80, 90, 120]);
+
+    // Aviso falado — interrompe qualquer fala anterior (anúncios de proximidade).
+    Speech.stop();
+    Speech.speak('Descrição de IA em andamento, por favor aguarde.', {
+      language: 'pt-BR',
+      rate: 1.05,
+    });
 
     const currentMode = modeRef.current;
 
@@ -98,6 +329,7 @@ function CameraContent() {
       const photo = await cameraRef.current.takePictureAsync({
         base64: true,
         quality: 0.6,
+        shutterSound: false,
       });
 
       setStatusText('Analisando…');
@@ -118,6 +350,7 @@ function CameraContent() {
         rate: currentMode === 'rapido' ? 1.1 : 0.95,
       });
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      Vibration.vibrate(50);
     } catch (err) {
       const detail = err instanceof Error ? err.message : 'erro desconhecido';
       console.warn('[Olha.AI] erro ao chamar backend:', detail, 'URL:', API_URL);
@@ -128,6 +361,7 @@ function CameraContent() {
         language: 'pt-BR',
       });
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      Vibration.vibrate([0, 200, 100, 200]);
     } finally {
       processingRef.current = false;
       setIsProcessing(false);
@@ -153,6 +387,11 @@ function CameraContent() {
     [toggleMode, capture],
   );
 
+  const onLayout = useCallback((e: LayoutChangeEvent) => {
+    const { width, height } = e.nativeEvent.layout;
+    setViewSize({ width, height });
+  }, []);
+
   if (!permission) return <View style={styles.camera} />;
 
   if (!permission.granted) {
@@ -177,12 +416,25 @@ function CameraContent() {
   return (
     <View
       style={styles.camera}
+      onLayout={onLayout}
       {...panResponder.panHandlers}
       accessible
       accessibilityLabel="Câmera do Olha.AI"
       accessibilityHint="Toque para descrever a cena. Deslize para trocar o modo."
     >
-      <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" />
+      <CameraView
+        ref={cameraRef}
+        style={StyleSheet.absoluteFill}
+        facing="back"
+        animateShutter={false}
+        onCameraReady={() => { cameraReadyRef.current = true; }}
+      />
+
+      <DetectionsOverlay
+        detections={detections}
+        imgSize={imgSize}
+        viewSize={viewSize}
+      />
 
       <View
         style={[styles.modeBadge, mode === 'rapido' ? styles.badgeFast : styles.badgeDetailed]}
@@ -204,9 +456,18 @@ function CameraContent() {
         <Text style={styles.hintText}>
           Toque para descrever {'  •  '} Deslize para trocar o modo
         </Text>
+        {detections.length > 0 && (
+          <Text style={styles.detCount}>
+            {detections.length} objeto{detections.length === 1 ? '' : 's'} detectado{detections.length === 1 ? '' : 's'}
+          </Text>
+        )}
       </View>
     </View>
   );
+}
+
+function wait(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
 // ── Raiz do App ────────────────────────────────────────────────────────────
@@ -331,6 +592,35 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.4)',
     fontSize: 13,
     textAlign: 'center',
+  },
+  detCount: {
+    color: 'rgba(0,230,118,0.85)',
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 1,
+  },
+
+  // Overlay de detecção
+  bbox: {
+    position: 'absolute',
+    borderWidth: 2.5,
+    borderRadius: 6,
+    backgroundColor: 'transparent',
+  },
+  bboxLabel: {
+    position: 'absolute',
+    top: -22,
+    left: -2,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 4,
+    maxWidth: 220,
+  },
+  bboxLabelText: {
+    color: '#000',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.3,
   },
 
   // Permissão de câmera
